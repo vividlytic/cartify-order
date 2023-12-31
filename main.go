@@ -2,76 +2,77 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"flag"
+	"fmt"
 	"log"
-	"time"
+	"net"
+	"os"
+
+	"cartify/order/infrastructure/repository"
+	"cartify/order/interfaces"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-type OrderItem struct {
-	ItemId    int `bson:"itemId"`
-	Quantity  int `bson:"quantity"`
-	UnitPrice int `bson:"unitPrice"`
-}
-
-type OrderEvent struct {
-	ID           string
-	CustomerId   string
-	CustomerName string
-	OrderItem    []OrderItem
-}
-
-// エラーをチェックするヘルパー関数
-func failOnError(err error, msg string) {
-	if err != nil {
-		log.Panicf("%s: %s", msg, err)
-	}
-}
+var (
+	port = flag.Int("port", 50052, "The server port")
+)
 
 func main() {
-	// RabbitMQ サーバーへの接続
-	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
-	failOnError(err, "Failed to connect to RabbitMQ") // エラーをチェックするヘルパー関数
-	defer conn.Close()
+	flag.Parse()
 
-	// チャネルの作成
-	ch, err := conn.Channel()
-	failOnError(err, "Failed to open a channel")
-	defer ch.Close()
-
-	q, err := ch.QueueDeclare(
-		"order", // 名前
-		false,   // 永続的（キューはブローカーの再起動後も存続）
-		false,   // 未使用の場合削除
-		false,   // 排他的（1つの接続のみで使用され、その接続が閉じるとキューは削除）
-		false,   // 待機なし
-		nil,     // 引数（オプション）
-	)
-	failOnError(err, "Failed to declare a queue")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	orderEvent := OrderEvent{
-		ID:           "test_id",
-		CustomerId:   "test",
-		CustomerName: "customer name",
-		OrderItem:    []OrderItem{},
+	uri := os.Getenv("DATABASE")
+	if uri == "" {
+		uri = "mongodb://localhost:27017/orders"
 	}
 
-	body, err2 := json.Marshal(orderEvent)
-	failOnError(err2, "Failed to marshal")
+	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri))
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		if err := client.Disconnect(context.TODO()); err != nil {
+			panic(err)
+		}
+	}()
 
-	// メッセージをキューにパブリッシュ
-	err = ch.PublishWithContext(ctx,
-		"",     // exchange
-		q.Name, // routing key
-		false,  // mandatory
-		false,  // immediate
-		amqp.Publishing{
-			ContentType: "text/plain",
-			Body:        []byte(body),
-		})
-	failOnError(err, "Failed to publish a message")
-	log.Printf(" [x] Sent %s\n", body)
+	rabbitmqUri := os.Getenv("RABBITMQ")
+	if rabbitmqUri == "" {
+		rabbitmqUri = "amqp://guest:guest@localhost:5672/"
+	}
+	conn, err := amqp.Dial(rabbitmqUri)
+	if err != nil {
+		log.Print("Failed to connect to RabbitMQ")
+		panic(err)
+	}
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Print("Failed to open a channel")
+		panic(err)
+	}
+	defer ch.Close()
+
+	orderRepository := repository.NewOrderRepository(client)
+	eventRepository := repository.NewEventRepository(ch)
+
+	server := interfaces.NewServer(interfaces.ServerParams{
+		OrderRepository: orderRepository,
+		EventRepository: eventRepository,
+	})
+
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
+
+	fmt.Println("server listening at", lis.Addr())
+
+	if err = server.Serve(lis); err != nil {
+		log.Fatalf("failed to serve: %v", err)
+	}
 }
